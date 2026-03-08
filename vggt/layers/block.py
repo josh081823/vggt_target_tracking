@@ -74,9 +74,12 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
-        def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos))
+    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
+        def attn_residual_func(x: Tensor, pos=None, attn_mask=None) -> Tensor:
+            if attn_mask is not None:
+                return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
+            else:
+                return self.ls1(self.attn(self.norm1(x), pos=pos))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
@@ -84,22 +87,22 @@ class Block(nn.Module):
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1
             x = drop_add_residual_stochastic_depth(
-                x, pos=pos, residual_func=attn_residual_func, sample_drop_ratio=self.sample_drop_ratio
+                x, pos=pos, attn_mask=attn_mask, residual_func=attn_residual_func, sample_drop_ratio=self.sample_drop_ratio
             )
             x = drop_add_residual_stochastic_depth(
                 x, residual_func=ffn_residual_func, sample_drop_ratio=self.sample_drop_ratio
             )
         elif self.training and self.sample_drop_ratio > 0.0:
-            x = x + self.drop_path1(attn_residual_func(x, pos=pos))
+            x = x + self.drop_path1(attn_residual_func(x, pos=pos, attn_mask=attn_mask))
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x, pos=pos)
+            x = x + attn_residual_func(x, pos=pos, attn_mask=attn_mask)
             x = x + ffn_residual_func(x)
         return x
 
 
 def drop_add_residual_stochastic_depth(
-    x: Tensor, residual_func: Callable[[Tensor], Tensor], sample_drop_ratio: float = 0.0, pos=None
+    x: Tensor, residual_func: Callable[[Tensor], Tensor], sample_drop_ratio: float = 0.0, pos=None, attn_mask=None
 ) -> Tensor:
     # 1) extract subset using permutation
     b, n, d = x.shape
@@ -108,10 +111,17 @@ def drop_add_residual_stochastic_depth(
     x_subset = x[brange]
 
     # 2) apply residual_func to get residual
-    if pos is not None:
+    if pos is not None and attn_mask is not None:
         # if necessary, apply rope to the subset
         pos = pos[brange]
+        attn_mask = attn_mask[brange]
+        residual = residual_func(x_subset, pos=pos, attn_mask=attn_mask)
+    elif pos is not None:
+        pos = pos[brange]
         residual = residual_func(x_subset, pos=pos)
+    elif attn_mask is not None:
+        attn_mask = attn_mask[brange]
+        residual = residual_func(x_subset, attn_mask=attn_mask)
     else:
         residual = residual_func(x_subset)
 

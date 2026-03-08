@@ -11,6 +11,7 @@ import logging
 import os
 import warnings
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -46,8 +47,10 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
+        self.save_attention = False
+        self.attn_map = None
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -57,11 +60,27 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
+        if self.save_attention:
+            # Calculate attention map for visualization (manual path)
+            q_vis = q * self.scale
+            attn_vis = q_vis @ k.transpose(-2, -1)
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    attn_vis = attn_vis.masked_fill(attn_mask, float("-inf"))
+                else:
+                    attn_vis = attn_vis + attn_mask
+            self.attn_map = attn_vis.softmax(dim=-1).detach().cpu()
+
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.attn_drop.p if self.training else 0.0)
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    attn = attn.masked_fill(attn_mask, float("-inf"))
+                else:
+                    attn = attn + attn_mask
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
@@ -73,12 +92,15 @@ class Attention(nn.Module):
 
 
 class MemEffAttention(Attention):
-    def forward(self, x: Tensor, attn_bias=None, pos=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, pos=None, attn_mask=None) -> Tensor:
         assert pos is None
-        if not XFORMERS_AVAILABLE:
+        if attn_mask is not None:
             if attn_bias is not None:
-                raise AssertionError("xFormers is required for using nested tensors")
-            return super().forward(x)
+                raise ValueError("Cannot provide both attn_bias and attn_mask")
+            attn_bias = attn_mask
+
+        if not XFORMERS_AVAILABLE:
+            return super().forward(x, attn_mask=attn_bias)
 
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)

@@ -15,6 +15,7 @@ from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from vggt.utils.target_mask import get_gt_mask, generate_ref_mask, visualize_mask_and_scores, visualize_camera_attention
 
 logger = logging.getLogger(__name__)
 
@@ -181,21 +182,32 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self, images: torch.Tensor, early_stage_masking: bool = False
+    ) -> Tuple[List[torch.Tensor], int, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            early_stage_masking (bool): Whether to apply early stage masking to layers 1-5.
 
         Returns:
-            (list[torch.Tensor], int):
-                The list of outputs from the attention blocks,
-                and the patch_start_idx indicating where patch tokens begin.
+            (list[torch.Tensor], int, Optional[torch.Tensor], Optional[torch.Tensor]):
+                - The list of outputs from the attention blocks,
+                - The patch_start_idx indicating where patch tokens begin.
+                - The generated dynamic mask if early_stage_masking is True.
+                - The generated scores if early_stage_masking is True.
         """
         B, S, C_in, H, W = images.shape
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
+        
+        dynamic_mask = None
+        scores = None
+        if not self.training and early_stage_masking:
+            valid_patch_mask = get_gt_mask(images[:, -1], self.patch_size)
+
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
@@ -231,19 +243,90 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
+        # Prepare attention masks for early-stage masking (layers 1-5)
+        frame_attn_mask = None
+        global_attn_mask = None
+
+        if not self.training and early_stage_masking:
+            with torch.no_grad():
+                temp_tokens = tokens.clone()
+                temp_frame_idx = 0
+                temp_global_idx = 0
+                layers_to_use = [1, 2]
+                max_layer = 2
+                frame_features_list = []
+                current_layer = 0
+
+                for _ in range(max_layer+1):
+                    for attn_type in self.aa_order:
+                        if attn_type == "frame":
+                            temp_tokens, temp_frame_idx, frame_intermediates = self._process_frame_attention(
+                                temp_tokens, B, S, P, C, temp_frame_idx, pos=pos, attn_mask=None
+                            )
+                        elif attn_type == "global":
+                            temp_tokens, temp_global_idx, global_intermediates = self._process_global_attention(
+                                temp_tokens, B, S, P, C, temp_global_idx, pos=pos, attn_mask=None
+                            )
+                        else:
+                            raise ValueError(f"Unknown attention type: {attn_type}")
+
+                    for i in range(len(frame_intermediates)):
+                        frame_features_list.append(frame_intermediates[i][:, :, self.patch_start_idx:, :])
+
+                    current_layer += len(frame_intermediates)
+
+                print("Generating reference mask...")
+                dynamic_mask, scores = generate_ref_mask(frame_features_list, layers_to_use=layers_to_use, threshold_quantile=0.887, ref_patch_mask=valid_patch_mask)
+                
+                # Cleanup
+                del temp_tokens, frame_intermediates, global_intermediates, frame_features_list
+                torch.cuda.empty_cache()
+
+            if dynamic_mask is not None:
+                # Flatten dynamic_mask if it's 4D [B, S, H, W] -> [B, S, P_patches]
+                if dynamic_mask.dim() == 4:
+                    dynamic_mask = dynamic_mask.flatten(2)
+
+                # Pad mask for special tokens (camera + registers) which are always kept (False -> Keep)
+                # dynamic_mask: [B, S, P_patches] -> full_mask: [B, S, P]
+                # P = patch_start_idx + P_patches
+                
+                # Attention mask logic: True means suppress (ignore), False means attend (keep).
+                # dynamic_mask is 1 (True) for target, 0 (False) for background.
+                # We want to keep Target and Special tokens, and suppress Background.
+                mask_pad = torch.zeros((B, S, self.patch_start_idx), dtype=torch.bool, device=dynamic_mask.device)
+                # Invert dynamic_mask: 1 (Target) -> False (Keep), 0 (Background) -> True (Suppress)
+                patches_mask = ~dynamic_mask.bool()
+                full_mask = torch.cat([mask_pad, patches_mask], dim=2)
+
+                # Frame attention mask: [B*S, 1, 1, P]
+                # We want to mask positions where full_mask is True.
+                frame_attn_mask = full_mask.view(B * S, P).unsqueeze(1).unsqueeze(1)
+
+                # Global attention mask: [B, 1, 1, S*P]
+                # Flatten S and P dimensions
+                global_attn_mask = full_mask.view(B, S * P).unsqueeze(1).unsqueeze(1)
+                print("Early stage attention masks generated.")
+
         frame_idx = 0
         global_idx = 0
         output_list = []
+
+        # Enable attention saving for the last layer to visualize camera attention
+        if len(self.frame_blocks) > 0:
+            self.frame_blocks[-1].attn.save_attention = True
+        if len(self.global_blocks) > 0:
+            self.global_blocks[-1].attn.save_attention = True
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos, attn_mask=frame_attn_mask
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, attn_mask=global_attn_mask
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -253,12 +336,43 @@ class Aggregator(nn.Module):
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
 
+        # Visualize camera attention if available
+        patch_h = H // self.patch_size
+        patch_w = W // self.patch_size
+        
+        for i, blk in enumerate(self.frame_blocks):
+            if blk.attn.attn_map is not None:
+                visualize_camera_attention(blk.attn.attn_map, patch_h, patch_w, f"camera_attn_frame_layer_{i}.png", i, self.patch_start_idx)
+                blk.attn.attn_map = None
+                blk.attn.save_attention = False
+
+        for i, blk in enumerate(self.global_blocks):
+            if blk.attn.attn_map is not None:
+                # attn_map: [B, H, S*P, S*P] -> [S, H, P, P] (intra-frame)
+                # Assuming B=1
+                attn_map = blk.attn.attn_map
+                if attn_map.shape[0] == 1:
+                    # Reshape to extract intra-frame attention
+                    # [1, H, S*P, S*P] -> [1, H, S, P, S, P]
+                    attn_map = attn_map.view(1, -1, S, P, S, P)
+                    # Extract diagonal on S dimensions (dim 2 and 4)
+                    # Result: [1, H, P, P, S]
+                    attn_map = attn_map.diagonal(dim1=2, dim2=4)
+                    # Permute to [S, 1, H, P, P] -> [S, H, P, P]
+                    attn_map = attn_map.permute(4, 0, 1, 2, 3).squeeze(1)
+                    
+                    visualize_camera_attention(attn_map, patch_h, patch_w, f"camera_attn_global_layer_{i}.png", i, self.patch_start_idx)
+                
+                blk.attn.attn_map = None
+                blk.attn.save_attention = False
+
         del concat_inter
         del frame_intermediates
         del global_intermediates
-        return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+        return output_list, self.patch_start_idx, dynamic_mask, scores
+
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, attn_mask=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -273,16 +387,19 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            # Apply mask only to layers 1-5 (indices 0-4)
+            mask = attn_mask if (frame_idx < 5 and attn_mask is not None) else None
+
             if self.training:
-                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+                tokens = self.frame_blocks[frame_idx](tokens, pos=pos, attn_mask=mask)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, attn_mask=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -296,10 +413,13 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            # Apply mask only to layers 1-5 (indices 0-4)
+            mask = attn_mask if (global_idx < 5 and attn_mask is not None) else None
+
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

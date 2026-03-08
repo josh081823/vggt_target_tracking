@@ -26,7 +26,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None, early_stage_masking: bool = False):
         """
         Forward pass of the VGGT model.
 
@@ -36,6 +36,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            early_stage_masking (bool): If True, generate and use a mask in early aggregator stages.
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -50,6 +51,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 - track (torch.Tensor): Point tracks with shape [B, S, N, 2] (from the last iteration), in pixel coordinates
                 - vis (torch.Tensor): Visibility scores for tracked points with shape [B, S, N]
                 - conf (torch.Tensor): Confidence scores for tracked points with shape [B, S, N]
+
+                If early_stage_masking is True, also includes:
+                - dynamic_mask (torch.Tensor): The generated mask for the target object.
+                - mask_scores (torch.Tensor): The scores used to generate the mask.
         """        
         # If without batch dimension, add it
         if len(images.shape) == 4:
@@ -58,9 +63,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx, dynamic_mask, scores = self.aggregator(
+            images, early_stage_masking=early_stage_masking
+        )
 
         predictions = {}
+
+        if dynamic_mask is not None:
+            predictions["dynamic_mask"] = dynamic_mask
+        if scores is not None:
+            predictions["mask_scores"] = scores
 
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
@@ -94,4 +106,3 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["images"] = images  # store the images for visualization during inference
 
         return predictions
-
