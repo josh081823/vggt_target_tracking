@@ -187,49 +187,6 @@ def generate_ref_mask(frame_features_list, layers_to_use=[2, 3], threshold_quant
     
     return mask, final_scores
 
-def visualize_mask_and_scores(masks, scores, patch_h, patch_w, save_path):
-    """
-    Visualizes the generated masks and their corresponding scores for debugging.
-
-    Args:
-        masks (torch.Tensor): The binary mask tensor, shape [B, S, P].
-        scores (torch.Tensor): The score tensor, shape [B, S, P].
-        patch_h (int): The height of the patch grid.
-        patch_w (int): The width of the patch grid.
-        save_path (str or Path): The path to save the visualization.
-    """
-    # Assuming B=1 for visualization, we take the first item in the batch.
-    if masks.shape[0] > 1 or scores.shape[0] > 1:
-        print(f"Info: Visualizing only the first item of a batch with size {masks.shape[0]}.")
-    
-    masks_vis = masks[0].cpu()   # Shape [S, P]
-    scores_vis = scores[0].cpu() # Shape [S, P]
-    
-    S = masks_vis.shape[0]
-    print(f"Visualizing masks for {S} frames...")
-    
-    fig, axes = plt.subplots(S, 2, figsize=(10, 3 * S), squeeze=False)
-
-    for i in range(S):
-        score_map = scores_vis[i].reshape(patch_h, patch_w).numpy()
-        mask_map = masks_vis[i].reshape(patch_h, patch_w).numpy()
-        
-        # Plot Score Map
-        im = axes[i, 0].imshow(score_map, cmap='viridis', vmin=0, vmax=1)
-        axes[i, 0].set_title(f"Frame {i} Similarity (Max: {score_map.max():.2f})")
-        fig.colorbar(im, ax=axes[i, 0])
-        axes[i, 0].axis('off')
-
-        # Plot Mask Map
-        axes[i, 1].imshow(mask_map, cmap='gray', vmin=0, vmax=1)
-        axes[i, 1].set_title(f"Frame {i} Mask")
-        axes[i, 1].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-    print(f"Saved debug visualization to: {save_path}")
-
 def visualize_camera_attention(attn_map, patch_h, patch_w, save_path, layer_idx, patch_start_idx=5):
     """
     Visualizes the attention map of the camera token towards patch tokens.

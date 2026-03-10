@@ -15,7 +15,7 @@ from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
-from vggt.utils.target_mask import get_gt_mask, generate_ref_mask, visualize_mask_and_scores, visualize_camera_attention
+from vggt.utils.target_mask import get_gt_mask, generate_ref_mask, visualize_camera_attention
 
 logger = logging.getLogger(__name__)
 
@@ -312,11 +312,14 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
 
-        # Enable attention saving for the last layer to visualize camera attention
-        if len(self.frame_blocks) > 0:
-            self.frame_blocks[-1].attn.save_attention = True
-        if len(self.global_blocks) > 0:
-            self.global_blocks[-1].attn.save_attention = True
+        vis_cam_attention = False
+        # Set to True to enable camera attention visualization
+        if vis_cam_attention:
+            # Enable attention saving for the last layer to visualize camera attention
+            if len(self.frame_blocks) > 0:
+                self.frame_blocks[-1].attn.save_attention = True
+            if len(self.global_blocks) > 0:
+                self.global_blocks[-1].attn.save_attention = True
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -369,6 +372,12 @@ class Aggregator(nn.Module):
         del concat_inter
         del frame_intermediates
         del global_intermediates
+
+        # Reshape mask and scores for easier visualization
+        if dynamic_mask is not None:
+            dynamic_mask = dynamic_mask.view(B, S, patch_h, patch_w)
+        if scores is not None:
+            scores = scores.view(B, S, patch_h, patch_w)
 
         return output_list, self.patch_start_idx, dynamic_mask, scores
 
