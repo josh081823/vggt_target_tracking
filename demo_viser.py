@@ -100,13 +100,25 @@ def viser_wrapper(
     conf_flat = conf.reshape(-1)
 
     cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4) typically
-    # For convenience, we store only (3,4) portion
-    cam_to_world = cam_to_world_mat[:, :3, :]
 
-    # Compute scene center and recenter
-    scene_center = np.mean(points, axis=0)
-    points_centered = points - scene_center
-    cam_to_world[..., -1] -= scene_center
+    # --- New logic to set world coordinate system to camera 0 ---
+    # The pose of the first camera in the original arbitrary world frame.
+    T_world_cam0 = cam_to_world_mat[0]
+
+    # The transformation that moves camera 0 to the new world origin.
+    # This is the inverse of camera 0's pose.
+    T_newworld_world = np.linalg.inv(T_world_cam0)
+
+    # Transform all points to the new coordinate system (camera 0's frame).
+    # points_new = T_newworld_world @ points_old_homogeneous
+    points_h = np.hstack([points, np.ones((points.shape[0], 1))])
+    points_centered = (T_newworld_world @ points_h.T).T[:, :3]
+
+    # Transform all camera poses to the new coordinate system.
+    # T_newworld_cami = T_newworld_world @ T_world_cami
+    cam_to_world_mat_new = T_newworld_world @ cam_to_world_mat
+    cam_to_world = cam_to_world_mat_new[:, :3, :]
+    # --- End of new logic ---
 
     # Store frame indices so we can filter by frame
     frame_indices = np.repeat(np.arange(S), H * W)
