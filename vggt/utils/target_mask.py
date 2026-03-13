@@ -24,7 +24,8 @@ def get_gt_mask(ref_image_tensor, patch_size):
     
     # 如果 patch 中绝大部分是白色 (>0.99)，则认为是背景，不参与匹配
     # TODO: 这个阈值可以调整，或者改为动态计算 (例如使用分位数)
-    patch_mask = (is_white_patch < 0.99).view(-1)
+    background_threshold = 0.99
+    patch_mask = (is_white_patch < background_threshold).view(-1)
     return patch_mask
 
 def get_similarity(q_tokens, ref_tokens, valid_patch_mask=None, top_k=5, temp=0.05):
