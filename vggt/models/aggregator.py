@@ -237,7 +237,7 @@ class Aggregator(nn.Module):
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
             pos = pos + 1
-            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2, device=images.device, dtype=pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
 
         # update P because we added special tokens
@@ -280,7 +280,16 @@ class Aggregator(nn.Module):
                 
                 # Cleanup
                 del temp_tokens, frame_intermediates, global_intermediates, frame_features_list
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
+
+                # Reshape mask and scores for easier visualization
+                if dynamic_mask is not None:
+                    dynamic_mask = dynamic_mask.view(B, S, H // self.patch_size, W // self.patch_size)
+                if scores is not None:
+                    scores = scores.view(B, S, H // self.patch_size, W // self.patch_size)
+
+                return [], self.patch_start_idx, dynamic_mask, scores
+
 
             if dynamic_mask is not None:
                 # Flatten dynamic_mask if it's 4D [B, S, H, W] -> [B, S, P_patches]
