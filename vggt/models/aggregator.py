@@ -183,13 +183,21 @@ class Aggregator(nn.Module):
                 self.patch_embed.mask_token.requires_grad_(False)
 
     def forward(
-        self, images: torch.Tensor, early_stage_masking: bool = False
+        self,
+        images: torch.Tensor,
+        early_stage_masking: bool = False,
+        cached_patch_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
             early_stage_masking (bool): Whether to apply early stage masking to layers 1-5.
+            cached_patch_tokens (Optional[torch.Tensor]): Pre-computed patch tokens with shape
+                [B, S, P, C].  A frame slot that is None (indicated by passing a tensor filled
+                with nan for that slice) means "not cached; run patch_embed for this frame".
+                When all S slots are provided the patch_embed call is skipped entirely.
+                Pass None (default) to disable caching and run the full patch_embed as before.
 
         Returns:
             (list[torch.Tensor], int, Optional[torch.Tensor], Optional[torch.Tensor]):
@@ -202,23 +210,39 @@ class Aggregator(nn.Module):
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
-        
+
         dynamic_mask = None
         scores = None
         if not self.training and early_stage_masking:
             valid_patch_mask = get_gt_mask(images[:, -1], self.patch_size)
 
+        # ── Patch embedding (with optional per-frame cache) ──────────────────
+        if cached_patch_tokens is not None:
+            # cached_patch_tokens: [B, S, P, C]
+            # Find which frame indices are NOT yet cached (marked by nan).
+            # A frame is considered uncached when its first element is nan.
+            cached_flat = cached_patch_tokens.view(B * S, -1)          # [B*S, P*C]
+            uncached_mask = torch.isnan(cached_flat[:, 0])              # [B*S]
 
-        # Normalize images and reshape for patch embed
-        images = (images - self._resnet_mean) / self._resnet_std
+            if uncached_mask.any():
+                # Run patch_embed only for uncached frames
+                imgs_norm = (images - self._resnet_mean) / self._resnet_std
+                imgs_flat = imgs_norm.view(B * S, C_in, H, W)
+                new_tokens = self.patch_embed(imgs_flat[uncached_mask])
+                if isinstance(new_tokens, dict):
+                    new_tokens = new_tokens["x_norm_patchtokens"]       # [N_new, P, C]
 
-        # Reshape to [B*S, C, H, W] for patch embedding
-        images = images.view(B * S, C_in, H, W)
-        patch_tokens = self.patch_embed(images)
-        
-
-        if isinstance(patch_tokens, dict):
-            patch_tokens = patch_tokens["x_norm_patchtokens"]
+                patch_tokens = cached_patch_tokens.view(B * S, *cached_patch_tokens.shape[2:]).clone()
+                patch_tokens[uncached_mask] = new_tokens
+            else:
+                patch_tokens = cached_patch_tokens.view(B * S, *cached_patch_tokens.shape[2:])
+        else:
+            # Original full-sequence patch embedding path
+            images = (images - self._resnet_mean) / self._resnet_std
+            images = images.view(B * S, C_in, H, W)
+            patch_tokens = self.patch_embed(images)
+            if isinstance(patch_tokens, dict):
+                patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         _, P, C = patch_tokens.shape
 
