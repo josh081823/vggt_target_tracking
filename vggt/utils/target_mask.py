@@ -111,7 +111,8 @@ def refine_scores_with_self_attention(scores, tokens, quantile_threshold=0.8, te
         
     return refined_scores
 
-def generate_ref_mask(frame_features_list, layers_to_use=[2, 3], threshold_quantile=0.7, ref_patch_mask=None):
+def generate_ref_mask(frame_features_list, layers_to_use=[2, 3], threshold_quantile=0.7, ref_patch_mask=None,
+                      sa_quantile=0.92, sa_temp=0.1, sim_top_k=5, sim_temp=0.2):
     """
     方法说明：
     使用 VGGT 交替注意力的指定层共同生成目标物体掩码。
@@ -154,7 +155,7 @@ def generate_ref_mask(frame_features_list, layers_to_use=[2, 3], threshold_quant
                     mask_b = ref_patch_mask
 
             for i in range(S):
-                s_frame = get_similarity(frame_norm[b, i], ref_f, mask_b, top_k=5, temp=0.2)
+                s_frame = get_similarity(frame_norm[b, i], ref_f, mask_b, top_k=sim_top_k, temp=sim_temp)
                 layer_scores_sum[b, i] += s_frame
             
     # 3. Combine
@@ -166,7 +167,7 @@ def generate_ref_mask(frame_features_list, layers_to_use=[2, 3], threshold_quant
     concat_features = torch.nn.functional.normalize(concat_features, p=2, dim=-1) # 重新归一化
     
     for b in range(B):
-        final_scores[b] = refine_scores_with_self_attention(final_scores[b], concat_features[b], quantile_threshold=0.92, temp=0.1)
+        final_scores[b] = refine_scores_with_self_attention(final_scores[b], concat_features[b], quantile_threshold=sa_quantile, temp=sa_temp)
 
     # 5. Threshold
     # Normalize final_scores to [0, 1] per frame

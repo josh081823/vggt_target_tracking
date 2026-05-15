@@ -276,8 +276,8 @@ class Aggregator(nn.Module):
                 temp_tokens = tokens.clone()
                 temp_frame_idx = 0
                 temp_global_idx = 0
-                layers_to_use = [1, 2]
-                max_layer = 2
+                layers_to_use = [0]
+                max_layer = 0
                 frame_features_list = []
                 current_layer = 0
 
@@ -300,7 +300,16 @@ class Aggregator(nn.Module):
                     current_layer += len(frame_intermediates)
 
                 print("Generating reference mask...")
-                dynamic_mask, scores = generate_ref_mask(frame_features_list, layers_to_use=layers_to_use, threshold_quantile=0.887, ref_patch_mask=valid_patch_mask)
+                dynamic_mask, scores = generate_ref_mask(
+                    frame_features_list,
+                    layers_to_use=layers_to_use,
+                    threshold_quantile=0.80,
+                    ref_patch_mask=valid_patch_mask,
+                    sa_quantile=0.91,
+                    sa_temp=0.450,
+                    sim_top_k=14,
+                    sim_temp=0.011,
+                )
                 
                 # Cleanup
                 del temp_tokens, frame_intermediates, global_intermediates, frame_features_list
