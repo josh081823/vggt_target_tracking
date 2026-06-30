@@ -69,6 +69,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        cached_layer_indices: Tuple[int, ...] = (4, 11, 17, 23),
     ):
         super().__init__()
 
@@ -116,6 +117,8 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.cached_layer_indices = set(cached_layer_indices)
+        self.cached_layer_indices.add(depth - 1)
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -276,8 +279,8 @@ class Aggregator(nn.Module):
                 temp_tokens = tokens.clone()
                 temp_frame_idx = 0
                 temp_global_idx = 0
-                layers_to_use = [1, 2]
-                max_layer = 2
+                layers_to_use = [0]
+                max_layer = 0
                 frame_features_list = []
                 current_layer = 0
 
@@ -300,7 +303,16 @@ class Aggregator(nn.Module):
                     current_layer += len(frame_intermediates)
 
                 print("Generating reference mask...")
-                dynamic_mask, scores = generate_ref_mask(frame_features_list, layers_to_use=layers_to_use, threshold_quantile=0.887, ref_patch_mask=valid_patch_mask)
+                dynamic_mask, scores = generate_ref_mask(
+                    frame_features_list,
+                    layers_to_use=layers_to_use,
+                    threshold_quantile=0.80,
+                    ref_patch_mask=valid_patch_mask,
+                    sa_quantile=0.91,
+                    sa_temp=0.450,
+                    sim_top_k=14,
+                    sim_temp=0.011,
+                )
                 
                 # Cleanup
                 del temp_tokens, frame_intermediates, global_intermediates, frame_features_list
@@ -368,9 +380,13 @@ class Aggregator(nn.Module):
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
             for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                layer_idx = len(output_list)
+                if layer_idx in self.cached_layer_indices:
+                    # concat frame and global intermediates, [B x S x P x 2C]
+                    concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                    output_list.append(concat_inter)
+                else:
+                    output_list.append(None)
 
         # Visualize camera attention if available
         patch_h = H // self.patch_size
@@ -402,7 +418,6 @@ class Aggregator(nn.Module):
                 blk.attn.attn_map = None
                 blk.attn.save_attention = False
 
-        del concat_inter
         del frame_intermediates
         del global_intermediates
 
